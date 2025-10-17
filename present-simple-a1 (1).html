@@ -1,0 +1,1212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Present Simple — A1/A1+ (Offline, Canvas)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<style>
+  html, body {
+    margin:0; padding:0; height:100%; width:100%; background:#0a1530;
+    -webkit-touch-callout:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent;
+    user-select:none; overscroll-behavior:none;
+    font-family:Poppins, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+  }
+  canvas { display:block; width:100vw; height:100vh; touch-action:manipulation; }
+</style>
+</head>
+<body>
+<canvas id="app" aria-label="Present Simple quiz canvas" role="application"></canvas>
+
+<script>
+(() => {
+'use strict';
+
+/* ===========================
+   CONFIG & CONSTANTS
+=========================== */
+const ACCESS_CODE = '1100'; // Not shown in UI
+const DPR = () => (window.devicePixelRatio || 1);
+const STATE = { START:'START', QUIZ:'QUIZ', BLACKOUT:'BLACKOUT', FINISH:'FINISH', ABOUT:'ABOUT' };
+const COLORS = {
+  bg1: '#0a1530',
+  bg2: '#0f2552',
+  glass: 'rgba(255,255,255,0.12)',
+  glassBorder: 'rgba(255,255,255,0.35)',
+  white: '#ffffff',
+  yellow: '#ffd54a',
+  orange: '#ff9f43',
+  red: '#ff5252',
+  blue: '#67b6ff',
+  green: '#A3E635'
+};
+const UI = {
+  baseFontPx: 13,
+  minTap: 44,
+  pad: 16,
+  cardR: 14,
+  chipR: 10,
+  line: 1.2,
+  toastMs: 950,
+  blackoutMs: 1500,
+  orderTime: 120,     // seconds
+  normalTime: 60,     // seconds
+  totalQuestions: 25,
+  headerH: 56,
+  trackerDot: 14
+};
+
+// Anti-cheat: protected keys
+const PROTECTED_KEYS = new Set([
+  'PrintScreen','F12'
+]);
+const PROTECTED_CTRL = new Set(['s','u','p','c','x','v','a','S','U','P','C','X','V','A']);
+
+/* ===========================
+   GLOBALS
+=========================== */
+const canvas = document.getElementById('app');
+const ctx = canvas.getContext('2d');
+
+let app = {
+  state: STATE.START,
+  w: 0, h: 0, dpr: DPR(),
+  now: performance.now(),
+  last: performance.now(),
+  pressed: false,
+  pointer: { x:0, y:0 },
+  rects: [], // clickable rects for current frame
+  toast: null,
+  blackout: null,
+  startCodeBuffer: '',
+  startError: '',
+  quiz: null,
+  progressAnim: 0,
+  aboutOpen: false,
+  lastPointerTs: 0,
+  lastResize: { w: window.innerWidth, h: window.innerHeight, ts: Date.now(), orientation: getOrientation() },
+  finishDownloaded: false
+};
+
+// Prevent default interactions (selection, context menu, copy/paste/drag)
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('copy', e => e.preventDefault());
+document.addEventListener('cut', e => e.preventDefault());
+document.addEventListener('paste', e => e.preventDefault());
+document.addEventListener('dragstart', e => e.preventDefault());
+document.addEventListener('selectstart', e => e.preventDefault());
+document.addEventListener('touchmove', e => { if (app.state !== STATE.QUIZ) e.preventDefault(); }, { passive:false });
+
+// Key security (allow digits for code & number keys for choices; block protected)
+window.addEventListener('keydown', (e) => {
+  // Allow digits in START keypad via our canvas; we don't use real inputs.
+  const isProtected =
+    PROTECTED_KEYS.has(e.key) ||
+    e.keyCode === 44 || // PrintScreen
+    e.keyCode === 123 || // F12
+    ((e.ctrlKey || e.metaKey) && PROTECTED_CTRL.has(e.key));
+
+  if (isProtected) {
+    e.preventDefault(); e.stopPropagation();
+    triggerSecurity('⚠️ Security Alert: Protected keys detected. Enter access code.');
+    return;
+  }
+});
+
+// Focus/visibility security
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    triggerSecurity('⚠️ Security Alert: Focus lost. Enter access code.');
+  }
+});
+window.addEventListener('blur', () => {
+  triggerSecurity('⚠️ Security Alert: Focus lost. Enter access code.');
+});
+window.addEventListener('pagehide', () => {
+  triggerSecurity('⚠️ Security Alert: Focus lost. Enter access code.');
+});
+
+// Resize/orientation security with mobile "grace" for tiny UI chrome shifts
+window.addEventListener('orientationchange', () => {
+  triggerSecurity('⚠️ Security Alert: Screen split detected. Enter access code.');
+});
+window.addEventListener('resize', () => {
+  const nw = window.innerWidth, nh = window.innerHeight;
+  const { w:pw, h:ph, orientation:po } = app.lastResize;
+  const ratioW = Math.abs(nw - pw) / Math.max(1, pw);
+  const ratioH = Math.abs(nh - ph) / Math.max(1, ph);
+  const nowO = getOrientation();
+  app.lastResize = { w:nw, h:nh, ts: Date.now(), orientation: nowO };
+
+  // Heuristic: small changes (< 0.12) likely toolbar/UI chrome; ignore.
+  // Since our keypad is canvas-based, mobile keyboard shouldn't open. Keep a bit of grace anyway.
+  const smallShift = (ratioW < 0.12 && ratioH < 0.12);
+  if (smallShift && po === nowO) {
+    // ignore
+  } else {
+    triggerSecurity('⚠️ Security Alert: Screen split detected. Enter access code.');
+  }
+});
+
+/* ===========================
+   POINTER INPUT
+=========================== */
+const getPt = (evt) => {
+  const rect = canvas.getBoundingClientRect();
+  let cx, cy;
+  if (evt.touches && evt.touches.length) {
+    cx = evt.touches[0].clientX; cy = evt.touches[0].clientY;
+  } else {
+    cx = evt.clientX; cy = evt.clientY;
+  }
+  const x = (cx - rect.left) * app.dpr;
+  const y = (cy - rect.top)  * app.dpr;
+  return { x, y };
+};
+
+const hitRect = (pt, r) => (pt.x >= r.x && pt.x <= r.x+r.w && pt.y >= r.y && pt.y <= r.y+r.h);
+
+canvas.addEventListener('pointerdown', (e) => {
+  app.pressed = true;
+  app.lastPointerTs = Date.now();
+  const pt = getPt(e);
+  app.pointer = pt;
+  handleTap(pt);
+});
+canvas.addEventListener('pointerup', () => { app.pressed = false; });
+
+/* ===========================
+   CORE LOOP & DRAW
+=========================== */
+function loop(ts) {
+  app.last = app.now; app.now = ts;
+  requestAnimationFrame(loop);
+  layout();
+  draw();
+}
+requestAnimationFrame(loop);
+
+function layout() {
+  // Resize DPR-aware
+  const cssW = window.innerWidth, cssH = window.innerHeight;
+  const dpr = DPR();
+  if (cssW !== app.w/app.dpr || cssH !== app.h/app.dpr || dpr !== app.dpr) {
+    app.dpr = dpr;
+    canvas.width  = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    app.w = canvas.width; app.h = canvas.height;
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.scale(1,1);
+  }
+}
+
+function draw() {
+  const { w, h } = app;
+  // Background gradient
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0, COLORS.bg1);
+  g.addColorStop(1, COLORS.bg2);
+  ctx.fillStyle = g; ctx.fillRect(0,0,w,h);
+
+  app.rects = [];
+
+  switch (app.state) {
+    case STATE.START: drawStart(); break;
+    case STATE.QUIZ: drawQuiz(); break;
+    case STATE.BLACKOUT: drawBlackout(); break;
+    case STATE.ABOUT: drawAbout(); break;
+    case STATE.FINISH: drawFinish(); break;
+  }
+
+  drawToast();
+}
+
+function setFont(px, weight=500) {
+  ctx.font = `${weight} ${px}px Poppins, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial`;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = COLORS.white;
+}
+
+function drawGlass(x,y,w,h, r=UI.cardR) {
+  // Glassmorphism: translucent fill + subtle border
+  roundRect(ctx, x,y,w,h,r);
+  ctx.fillStyle = COLORS.glass; ctx.fill();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = COLORS.glassBorder; ctx.stroke();
+}
+
+function roundRect(ctx, x,y,w,h,r) {
+  const rr = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x+rr,y);
+  ctx.arcTo(x+w,y,x+w,y+h,rr);
+  ctx.arcTo(x+w,y+h,x,y+h,rr);
+  ctx.arcTo(x,y+h,x,y,rr);
+  ctx.arcTo(x,y,x+w,y,rr);
+  ctx.closePath();
+}
+
+function drawPill(x,y,w,h, colorBorder, colorFill) {
+  roundRect(ctx, x,y,w,h, h/2);
+  if (colorFill) { ctx.fillStyle = colorFill; ctx.fill(); }
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = colorBorder; ctx.stroke();
+}
+
+function drawTitlePill(text, x, y, maxW) {
+  const pad = 12 * app.dpr;
+  setFont(UI.baseFontPx*app.dpr*1.0, 600);
+  const tw = ctx.measureText(text).width;
+  const w = Math.min(maxW, tw + pad*2), h = 36 * app.dpr;
+  const xx = x, yy = y;
+  drawPill(xx, yy, w, h, COLORS.glassBorder, 'rgba(255,255,255,0.10)');
+  setFont(UI.baseFontPx*app.dpr*1.0, 600);
+  ctx.fillStyle = COLORS.white;
+  ctx.textAlign = 'center';
+  ctx.fillText(text, xx + w/2, yy + h/2);
+  return { x:xx, y:yy, w, h };
+}
+
+function drawButton(text, x, y, w, h, id, fill='rgba(255,255,255,0.12)', stroke=COLORS.glassBorder) {
+  drawPill(x,y,w,h, stroke, fill);
+  setFont(UI.baseFontPx*app.dpr*1.0, 600);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = COLORS.white;
+  ctx.fillText(text, x + w/2, y + h/2);
+  app.rects.push({ id, x, y, w, h });
+  return {x,y,w,h};
+}
+
+function drawToast() {
+  if (!app.toast) return;
+  const t = app.toast, elapsed = performance.now() - t.ts;
+  if (elapsed > t.ms) { app.toast = null; return; }
+  const alpha = Math.min(1, 1 - ((elapsed - t.ms*0.6)/(t.ms*0.4)));
+  const pad = 14 * app.dpr;
+  setFont(UI.baseFontPx*app.dpr*1.0, 700);
+  const tw = ctx.measureText(t.text).width;
+  const w = tw + pad*2, h = 40*app.dpr;
+  const x = (app.w - w)/2, y = app.h - h - 24*app.dpr;
+  roundRect(ctx, x,y,w,h, h/2);
+  ctx.fillStyle = `rgba(0,0,0,${0.6*alpha})`; ctx.fill();
+  ctx.strokeStyle = `rgba(255,255,255,${0.6*alpha})`; ctx.stroke();
+  ctx.globalAlpha = alpha;
+  ctx.textAlign='center'; ctx.fillStyle = COLORS.white;
+  ctx.fillText(t.text, x+w/2, y+h/2);
+  ctx.globalAlpha = 1;
+}
+
+function showToast(text, ms=UI.toastMs) {
+  app.toast = { text, ts: performance.now(), ms };
+}
+
+/* ===========================
+   START / ABOUT / BLACKOUT
+=========================== */
+function drawStart() {
+  const { w,h } = app;
+  const pad = 24 * app.dpr;
+
+  // Title pill
+  const title = 'Present Simple — A1/A1+ (Offline)';
+  const titleRect = drawTitlePill(title, pad, pad, w - pad*2);
+
+  // Center card
+  const cardW = Math.min(w - pad*2, 520*app.dpr);
+  const cardH = Math.min(h - pad*4 - titleRect.h, 520*app.dpr);
+  const cx = (w - cardW)/2, cy = (h - cardH)/2 + 12*app.dpr;
+
+  drawGlass(cx, cy, cardW, cardH);
+
+  // Head
+  setFont(UI.baseFontPx*app.dpr*1.2, 700);
+  ctx.textAlign='center';
+  ctx.fillStyle=COLORS.white;
+  ctx.fillText('Enter access code to start', cx+cardW/2, cy + 40*app.dpr);
+
+  // Error
+  if (app.startError) {
+    setFont(UI.baseFontPx*app.dpr*1.0, 600);
+    ctx.fillStyle = COLORS.red;
+    ctx.fillText(app.startError, cx+cardW/2, cy + 70*app.dpr);
+  }
+
+  // Code display (masked)
+  const codeMask = '•'.repeat(app.startCodeBuffer.length);
+  const codeBoxH = 56*app.dpr;
+  drawPill(cx+pad, cy + 100*app.dpr, cardW - pad*2, codeBoxH, COLORS.glassBorder, 'rgba(255,255,255,0.08)');
+  setFont(UI.baseFontPx*app.dpr*1.6, 700);
+  ctx.textAlign='center'; ctx.fillStyle=COLORS.yellow;
+  ctx.fillText(codeMask || '____', cx+cardW/2, cy + 100*app.dpr + codeBoxH/2);
+
+  // Canvas numeric keypad (no system keyboard)
+  const gridTop = cy + 180*app.dpr;
+  const cols = 3, rows = 4;
+  const gap = 10*app.dpr;
+  const cellW = (cardW - pad*2 - gap*(cols-1)) / cols;
+  const cellH = Math.max(UI.minTap*app.dpr, 52*app.dpr);
+
+  const keys = ['1','2','3','4','5','6','7','8','9','CLR','0','START'];
+  for (let r=0;r<rows;r++){
+    for (let c=0;c<cols;c++){
+      const k = keys[r*cols + c];
+      const x = cx+pad + c*(cellW+gap);
+      const y = gridTop + r*(cellH+gap);
+      const id = 'key_'+k;
+      const fill = k==='START' ? 'rgba(255,165,0,0.35)' : 'rgba(255,255,255,0.10)';
+      const stroke = k==='START' ? COLORS.orange : COLORS.glassBorder;
+      drawButton(k, x,y, cellW, cellH, id, fill, stroke);
+    }
+  }
+
+  // Manual download button (for convenience)
+  const btnW = 180*app.dpr, btnH = 40*app.dpr;
+  drawButton('⬇ Download HTML', cx + (cardW-btnW)/2, cy + cardH - btnH - pad, btnW, btnH, 'download_now',
+             'rgba(255,255,255,0.12)', COLORS.blue);
+
+  // About link
+  const aboutY = cy + cardH - pad - 28*app.dpr - (btnH + 8*app.dpr);
+  setFont(UI.baseFontPx*app.dpr*0.95, 600);
+  ctx.textAlign='center';
+  ctx.fillStyle = COLORS.blue;
+  ctx.fillText('About', cx+cardW/2, aboutY + 14*app.dpr);
+  app.rects.push({ id:'about_link', x:cx, y:aboutY, w:cardW, h:28*app.dpr });
+}
+
+function drawAbout() {
+  const { w,h } = app; const pad = 20*app.dpr;
+  const cardW = Math.min(w - pad*2, 600*app.dpr);
+  const cardH = Math.min(h - pad*2, 400*app.dpr);
+  const x = (w-cardW)/2, y = (h-cardH)/2;
+  drawGlass(x,y,cardW,cardH);
+
+  setFont(UI.baseFontPx*app.dpr*1.2, 700);
+  ctx.textAlign='center';
+  ctx.fillText('About this quiz', x+cardW/2, y+36*app.dpr);
+
+  setFont(UI.baseFontPx*app.dpr*1.0, 500);
+  ctx.textAlign='left';
+  const text = [
+    '• Offline, single-file HTML5 Canvas app.',
+    '• Present Simple (affirm/neg), 3rd-person rules, adverbs, plural.',
+    '• Anti-cheat: focus/resize/keys → secure restart.',
+    '• Mobile-first (portrait), high-contrast glass UI.',
+    '• No external fonts/resources.'
+  ];
+  let ty = y + 70*app.dpr;
+  for (const line of text) {
+    ctx.fillText(line, x+pad, ty);
+    ty += 22*app.dpr;
+  }
+
+  const btnW = 120*app.dpr, btnH = 40*app.dpr;
+  drawButton('Close', x+cardW/2 - btnW/2, y+cardH-pad-btnH, btnW, btnH, 'about_close',
+             'rgba(255,255,255,0.10)', COLORS.glassBorder);
+}
+
+function drawBlackout() {
+  // Full black overlay with red text
+  ctx.fillStyle = '#000000'; ctx.globalAlpha = 0.95; ctx.fillRect(0,0,app.w,app.h); ctx.globalAlpha = 1;
+  setFont(UI.baseFontPx*app.dpr*1.2, 800);
+  ctx.textAlign='center'; ctx.fillStyle = COLORS.red;
+  const msg = app.blackout?.msg || '⚠️ Security Alert. Enter access code.';
+  ctx.fillText(msg, app.w/2, app.h/2);
+}
+
+/* ===========================
+   QUIZ ENGINE
+=========================== */
+
+function newQuiz() {
+  return {
+    questions: sampleQuestions(), // array of question objects
+    idx: 0,
+    correct: 0,
+    answers: [], // per question: true/false
+    timeLeft: 0,
+    questionStart: performance.now(),
+    timerType: 'normal', // 'normal' or 'order'
+    currRects: [], // interactive rects for current question
+    measured: {}, // per-question cached measurements
+    toastQueued: null,
+    tracker: [],
+    startedAt: new Date(),
+    finishedAt: null
+  };
+}
+
+function startQuiz() {
+  app.quiz = newQuiz();
+  prepareQuestion(app.quiz);
+  app.state = STATE.QUIZ;
+  app.progressAnim = 0;
+}
+
+function prepareQuestion(qz) {
+  const q = qz.questions[qz.idx];
+  qz.currRects = [];
+  qz.timerType = (q.type === 'order') ? 'order' : 'normal';
+  qz.timeLeft = (qz.timerType === 'order') ? UI.orderTime : UI.normalTime;
+  qz.questionStart = performance.now();
+  cacheMeasure(qz, q); // compute line breaks, etc.
+}
+
+function nextQuestion() {
+  const qz = app.quiz;
+  if (qz.idx < qz.questions.length - 1) {
+    qz.idx++;
+    prepareQuestion(qz);
+  } else {
+    qz.finishedAt = new Date();
+    app.state = STATE.FINISH;
+  }
+}
+
+/* ===========================
+   QUESTION BANK GENERATION
+=========================== */
+
+// Base vocabulary (40 verbs)
+const VERBS = ['go','come','make','take','see','get','give','tell','call','try','ask','work','look','use','find','put','keep','begin','help','talk','turn','start','show','play','run','move','write','read','open','close','walk','drive','ride','eat','drink','cook','clean','wash','buy','sell'];
+
+const ADVERBS = ['always','usually','often','sometimes','rarely','never'];
+const SUBJECTS = ['I','you','we','they','he','she','it'];
+const CONTEXTS = [
+  'every day','on Mondays','on weekends','in the morning','after lunch','before dinner',
+  'at 7 a.m.','at school','in class','at home','in the park','to work','at the store','on the bus'
+];
+
+const PLURAL_IRREG = {
+  'man':'men','woman':'women','child':'children','person':'people','mouse':'mice',
+  'foot':'feet','tooth':'teeth'
+};
+const PLURAL_SPECIAL = {
+  // -o defaults to -es; exceptions:
+  'photo':'photos','radio':'radios','piano':'pianos'
+};
+
+// Utility
+function endsWithAny(s, arr) { return arr.some(suffix => s.endsWith(suffix)); }
+
+function thirdPerson(verb) {
+  if (endsWithAny(verb, ['o','ch','sh','ss','x','z'])) return verb+'es';
+  if (verb.endsWith('y') && !'aeiou'.includes(verb[verb.length-2] || '')) {
+    return verb.slice(0,-1)+'ies';
+  }
+  return verb+'s';
+}
+
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+function randomOf(arr) { return arr[Math.floor(Math.random()*arr.length)]; }
+
+function shuffle(a) {
+  for (let i=a.length-1;i>0;i--) {
+    const j = Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]];
+  }
+  return a;
+}
+
+function sampleNoRepeat(arr, n) {
+  const copy = arr.slice();
+  shuffle(copy);
+  return copy.slice(0, Math.min(n, copy.length));
+}
+
+function pluralize(noun) {
+  if (PLURAL_IRREG[noun]) return PLURAL_IRREG[noun];
+  if (PLURAL_SPECIAL[noun]) return PLURAL_SPECIAL[noun];
+  if (noun.endsWith('y') && !'aeiou'.includes(noun[noun.length-2]||'')) {
+    return noun.slice(0,-1)+'ies';
+  }
+  if (endsWithAny(noun, ['o','ch','sh','ss','x','z'])) return noun+'es';
+  return noun+'s';
+}
+
+function wrongPluralOptions(noun, correct) {
+  const opts = new Set();
+  // Generate plausible wrong forms
+  if (correct.endsWith('es')) opts.add(noun+'s');
+  if (correct.endsWith('s') && !correct.endsWith('es')) opts.add(noun+'es');
+  if (noun.endsWith('y') && !'aeiou'.includes(noun[noun.length-2]||'')) {
+    opts.add(noun+'ys'); // wrong
+  } else if (noun.endsWith('y')) {
+    opts.add(noun.slice(0,-1)+'ies'); // wrong for vowel+y
+  }
+  // Add a random tweak
+  if (!PLURAL_IRREG[noun]) {
+    opts.add(noun+'ses');
+  }
+  const arr = Array.from(opts).filter(x => x.toLowerCase() !== correct.toLowerCase());
+  shuffle(arr);
+  return arr.slice(0,2);
+}
+
+// Create MCQ items (affirmative/negative/adverb)
+function buildMCQBank() {
+  const items = [];
+
+  // Affirmative — 3rd person focus + non-3rd
+  for (const v of VERBS) {
+    // 3rd person
+    const subj3 = randomOf(['he','she','it']);
+    const ctx = randomOf(CONTEXTS);
+    const correct = `${cap(subj3)} ${thirdPerson(v)} ${randomOf(['soccer','music','homework','video games','fast','slowly','coffee','lunch','at home','in the park','to school'])} ${ctx}.`;
+    const wrongA = `${cap(subj3)} ${v} ${randomOf(['soccer','music','homework','video games','coffee'])} ${ctx}.`;
+    const wrongB = `${cap(subj3)} ${v}es ${randomOf(['soccer','music','homework','video games','coffee'])} ${ctx}.`;
+    items.push({
+      type:'mcq',
+      subType:'affirm',
+      prompt:'Complete the sentence in the Present Simple (affirmative). Apply 3rd-person rules if needed.',
+      meta:`Subject: ${cap(subj3)} • Verb: ${v} • Context: ${ctx}`,
+      options: shuffle([correct, wrongA, wrongB]),
+      answerIndex: 0, // We'll fix after shuffle
+    });
+    // Re-align answerIndex
+    const ai = items[items.length-1].options.indexOf(correct);
+    items[items.length-1].answerIndex = ai;
+
+    // Non-3rd
+    const subj = randomOf(['I','you','we','they']);
+    const ctx2 = randomOf(CONTEXTS);
+    const correct2 = `${cap(subj)} ${v} ${randomOf(['at home','in the park','to school','to work','books'])} ${ctx2}.`;
+    const wrong2A = `${cap(subj)} ${thirdPerson(v)} ${randomOf(['at home','in the park','to school'])} ${ctx2}.`;
+    const wrong2B = `${cap(subj)} ${v}es ${randomOf(['at home','in the park','to school'])} ${ctx2}.`;
+    items.push({
+      type:'mcq',
+      subType:'affirm',
+      prompt:'Complete the sentence in the Present Simple (affirmative).',
+      meta:`Subject: ${cap(subj)} • Verb: ${v} • Context: ${ctx2}`,
+      options: shuffle([correct2, wrong2A, wrong2B]),
+      answerIndex: 0
+    });
+    items[items.length-1].answerIndex = items[items.length-1].options.indexOf(correct2);
+  }
+
+  // Negative (lexical verbs only; do/does + base)
+  for (const v of VERBS) {
+    const subj = randomOf(SUBJECTS);
+    const ctx = randomOf(CONTEXTS);
+    const third = ['he','she','it'].includes(subj.toLowerCase());
+    const correct = third ? `${cap(subj)} doesn’t ${v} ${randomOf(['at home','in the park','on Mondays','coffee'])} ${ctx}.`
+                          : `${cap(subj)} don’t ${v} ${randomOf(['at home','in the park','on Mondays','coffee'])} ${ctx}.`;
+    const wrongA = third ? `${cap(subj)} doesn’t ${thirdPerson(v)} ${randomOf(['at home','in the park'])} ${ctx}.`
+                         : `${cap(subj)} don’t ${thirdPerson(v)} ${randomOf(['at home','in the park'])} ${ctx}.`;
+    const wrongB = third ? `${cap(subj)} doesn’t to ${v} ${randomOf(['at home','in the park'])} ${ctx}.`
+                         : `${cap(subj)} don’t to ${v} ${randomOf(['at home','in the park'])} ${ctx}.`;
+    items.push({
+      type:'mcq',
+      subType:'neg',
+      prompt:'Choose the only grammatically correct negative sentence in the Present Simple.',
+      meta:`Subject: ${cap(subj)} • Verb: ${v} • Context: ${ctx}`,
+      options: shuffle([correct, wrongA, wrongB]),
+      answerIndex: 0
+    });
+    items[items.length-1].answerIndex = items[items.length-1].options.indexOf(correct);
+  }
+
+  // Adverb position
+  for (const v of sampleNoRepeat(VERBS, 28)) {
+    const subj = randomOf(['he','she','it']);
+    const adv = randomOf(ADVERBS);
+    const ctx = randomOf(CONTEXTS);
+    const obj = randomOf(['soccer','books','coffee','music','homework','videos','breakfast']);
+    const correct = `${cap(subj)} ${adv} ${thirdPerson(v)} ${obj}.`;
+    const wrongA  = `${cap(subj)} ${thirdPerson(v)} ${adv} ${obj}.`;
+    const wrongB  = `${cap(subj)} is ${adv} ${v} ${obj}.`; // using be + base (wrong)
+    const prompt = 'Choose the best option: correct position of the frequency adverb in Present Simple.';
+    items.push({
+      type:'mcq',
+      subType:'adverb',
+      prompt,
+      meta:`Subject: ${cap(subj)} • Verb: ${v} • Adverb: ${adv} • Context: ${ctx}`,
+      options: shuffle([correct, wrongA, wrongB]),
+      answerIndex: 0
+    });
+    items[items.length-1].answerIndex = items[items.length-1].options.indexOf(correct);
+  }
+
+  return items;
+}
+
+function buildPluralBank() {
+  const nouns = [
+    'man','woman','child','person','mouse','foot','tooth',
+    'city','baby','story','party','bunny','lady',
+    'bus','class','dish','box','fox','kiss','hero','potato','tomato',
+    'photo','radio','piano','book','cat','car','table','teacher'
+  ];
+  const items = [];
+  for (const n of nouns) {
+    const correct = pluralize(n);
+    const wrongs = wrongPluralOptions(n, correct);
+    const opts = shuffle([correct, ...wrongs.slice(0,2)]);
+    items.push({
+      type:'plural',
+      prompt:'Make it plural.',
+      meta:`Singular: ${n}`,
+      options: opts,
+      answerIndex: opts.indexOf(correct)
+    });
+  }
+  return items;
+}
+
+function buildMatchingBank() {
+  const items = [];
+  // Create 12 small sets
+  for (let i=0;i<12;i++){
+    const subjA = randomOf(['He','She','It','They']);
+    const subjB = randomOf(['We','They','He','She']);
+    const subjC = randomOf(['She','He','They','We']);
+    const v1 = randomOf(VERBS), v2 = randomOf(VERBS), v3 = randomOf(VERBS);
+    const ctx1 = randomOf(['to school on Mondays.','at 7 a.m.','in the park.','after lunch.']);
+    const ctx2 = randomOf(['at 7.','before dinner.','on weekends.','every day.']);
+    const ctx3 = randomOf(['after lunch.','at home.','in class.','in the morning.']);
+    const left = [
+      `${subjA} ___ ${ctx1}`,
+      `${subjB} ___ ${ctx2}`,
+      `${subjC} ___ ${ctx3}`
+    ];
+
+    // Build correct right forms (mix of affirm & neg)
+    const rightForms = [];
+    const addForm = (subj, verb) => {
+      const third = ['he','she','it'].includes(subj.toLowerCase());
+      const pickNeg = Math.random() < 0.5;
+      if (pickNeg) return third ? `doesn’t ${verb}` : `don’t ${verb}`;
+      return third ? `${thirdPerson(verb)}` : `${verb}`;
+    };
+    rightForms.push(addForm(subjA, v1));
+    rightForms.push(addForm(subjB, v2));
+    rightForms.push(addForm(subjC, v3));
+
+    // Build correct mapping by index
+    const correctMap = { 0: rightForms[0], 1: rightForms[1], 2: rightForms[2] };
+
+    // Derangement of right column
+    let right = rightForms.slice();
+    let attempts = 0;
+    do { shuffle(right); attempts++; if (attempts>20) break; }
+    while (right.some((rf, idx) => rf === rightForms[idx]));
+
+    items.push({
+      type:'matching',
+      prompt:'Match each sentence to the correct verb form. Tap left, then tap the matching form on the right.',
+      left, right,
+      answerMap: correctMap
+    });
+  }
+  return items;
+}
+
+function buildOrderBank() {
+  const items = [];
+  const subj3 = ['He','She','It'];
+  const subjN = ['I','You','We','They'];
+
+  const places = ['at home','in the park','at school','in class','at work'];
+  const objs = ['coffee','books','music','homework','videos','breakfast'];
+
+  for (let i=0;i<10;i++){
+    // Affirmative with adverb (3rd)
+    const s = randomOf(subj3), v = randomOf(VERBS), adv = randomOf(ADVERBS), obj = randomOf(objs), place = randomOf(places);
+    const tokens = [s, adv, thirdPerson(v), obj, place];
+    items.push({
+      type:'order',
+      prompt:'Arrange the tokens to make ONE correct sentence in the Present Simple (lexical verb only).',
+      tokens: tokens.slice(),
+      correct: tokens.slice()
+    });
+  }
+  for (let i=0;i<10;i++){
+    // Negative with adverb (3rd)
+    const s = randomOf(subj3), v = randomOf(VERBS), adv = randomOf(ADVERBS), obj = randomOf(objs), place = randomOf(places);
+    const tokens = [s, adv, "doesn't", v, obj, place];
+    items.push({
+      type:'order',
+      prompt:'Arrange the tokens to make ONE correct sentence in the Present Simple (lexical verb only).',
+      tokens: tokens.slice(),
+      correct: tokens.slice()
+    });
+  }
+  for (let i=0;i<8;i++){
+    // Negative non-3rd
+    const s = randomOf(subjN), v = randomOf(VERBS), adv = randomOf(ADVERBS), obj = randomOf(objs), place = randomOf(places);
+    const tokens = [s, adv, "don't", v, obj, place];
+    items.push({
+      type:'order',
+      prompt:'Arrange the tokens to make ONE correct sentence in the Present Simple (lexical verb only).',
+      tokens: tokens.slice(),
+      correct: tokens.slice()
+    });
+  }
+  return items;
+}
+
+// Build big banks once
+const BANK = {
+  mcq: buildMCQBank(),       // many items
+  plural: buildPluralBank(), // ~30
+  matching: buildMatchingBank(), // 12
+  order: buildOrderBank()    // 28
+};
+
+function sampleQuestions() {
+  // Target distribution (±1): 8–10 MCQ (Aff/Neg), 5–7 Adverbs (in MCQ),
+  // 4–6 Plural, 4–6 Matching/Order combined. We’ll enforce totals = 25.
+
+  // From MCQ bank, we’ll draw: 9 items (mixed aff/neg/adverb)
+  const mcqSet = sampleNoRepeat(BANK.mcq, 9);
+
+  // Plural: 5
+  const pluralSet = sampleNoRepeat(BANK.plural, 5);
+
+  // Matching: 4
+  const matchSet = sampleNoRepeat(BANK.matching, 4);
+
+  // Order: 7 (120s for each)
+  const orderSet = sampleNoRepeat(BANK.order, 7);
+
+  let all = [...mcqSet, ...pluralSet, ...matchSet, ...orderSet];
+
+  // Ensure EXACT 25
+  if (all.length > UI.totalQuestions) all = all.slice(0, UI.totalQuestions);
+  shuffle(all);
+
+  // Ensure uniqueness of options (case-insensitive) inside each item
+  for (const q of all) {
+    if (q.type === 'mcq' || q.type === 'plural') {
+      const seen = new Set();
+      q.options = q.options.filter(opt => {
+        const key = opt.trim().toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key); return true;
+      });
+      while (q.options.length < 3) q.options.push('[removed duplicate]');
+      // Recompute answerIndex if needed
+      if (q.type === 'mcq') {
+        // keep stored
+      } else if (q.type === 'plural') {
+        // ok
+      }
+    }
+  }
+  return all;
+}
+
+/* ===========================
+   RENDER QUIZ
+=========================== */
+
+function drawQuiz() {
+  const qz = app.quiz;
+  const { w,h } = app;
+  const pad = 16*app.dpr;
+
+  // Progress bar
+  const progress = (qz.idx)/UI.totalQuestions;
+  app.progressAnim += (progress - app.progressAnim) * 0.12;
+  const barW = w, barH = 6*app.dpr;
+  ctx.fillStyle = 'rgba(255,255,255,0.15)'; ctx.fillRect(0,0,barW,barH);
+  ctx.fillStyle = COLORS.blue; ctx.fillRect(0,0,Math.max(0,barW*app.progressAnim),barH);
+
+  // Title pill
+  const title = 'Present Simple — A1/A1+';
+  const titleRect = drawTitlePill(title, pad, barH + 8*app.dpr, Math.min(w - pad*2, 360*app.dpr));
+
+  // Timer (right)
+  const secLeft = Math.max(0, Math.ceil(qz.timeLeft));
+  const timeText = `Time: ${secLeft}s`;
+  setFont(UI.baseFontPx*app.dpr*1.0, 700);
+  ctx.textAlign='right';
+  ctx.fillStyle = secLeft <= 10 ? COLORS.red : COLORS.yellow;
+  ctx.fillText(timeText, w - pad, barH + 8*app.dpr + titleRect.h/2);
+
+  // Tracker (25 bubbles, multi-row)
+  const bubbles = UI.totalQuestions;
+  const gap = 6*app.dpr;
+  const dot = UI.trackerDot*app.dpr;
+  const perRow = Math.min(12, bubbles);
+  const rows = Math.ceil(bubbles / perRow);
+  let ty = barH + titleRect.h + 18*app.dpr;
+  let index = 0;
+  for (let r=0;r<rows;r++){
+    let rowCount = Math.min(perRow, bubbles - r*perRow);
+    const totalW = rowCount*(dot) + (rowCount-1)*gap;
+    let tx = (w - totalW)/2;
+    for (let c=0;c<rowCount;c++){
+      const i = r*perRow + c;
+      const status = (i < qz.idx) ? (qz.answers[i] ? 'ok':'bad') : (i === qz.idx ? 'now':'pending');
+      const col = status==='ok' ? COLORS.green : status==='bad' ? COLORS.red :
+                  status==='now' ? COLORS.orange : 'rgba(255,255,255,0.35)';
+      ctx.beginPath(); ctx.arc(tx+dot/2, ty+dot/2, dot/2, 0, Math.PI*2);
+      ctx.fillStyle = col; ctx.fill();
+      tx += dot + gap;
+      index++;
+    }
+    ty += dot + gap;
+  }
+
+  // CONTENT AREA
+  const contentTop = ty + 6*app.dpr;
+  const contentH = h - contentTop - pad;
+  const contentX = pad, contentW = w - pad*2;
+
+  // Prompt + meta (guide card)
+  const guideH = Math.min(contentH*0.36, 160*app.dpr);
+  drawGlass(contentX, contentTop, contentW, guideH);
+  const q = qz.questions[qz.idx];
+
+  // Prompt
+  setFont(UI.baseFontPx*app.dpr*1.0, 700);
+  ctx.textAlign='center';
+  const promptLines = wrapLines(q.prompt, contentW - 24*app.dpr);
+  let py = contentTop + 20*app.dpr;
+  for (const ln of promptLines) {
+    ctx.fillText(ln, contentX + contentW/2, py); py += 18*app.dpr;
+  }
+
+  // Meta pill centered
+  const metaText = (q.type==='mcq') ? (q.meta || '') :
+                   (q.type==='plural') ? (`${q.meta || ''}`) :
+                   (q.type==='matching') ? '3 pairs • Affirm/Negative mix' :
+                   (q.type==='order') ? 'Tap tokens to set (tap again to remove)' : '';
+  const metaW = Math.min(contentW-24*app.dpr, measure(metaText)+32*app.dpr);
+  drawPill(contentX + (contentW-metaW)/2, contentTop + guideH - 40*app.dpr, metaW, 28*app.dpr, COLORS.glassBorder, 'rgba(255,255,255,0.10)');
+  setFont(UI.baseFontPx*app.dpr*0.95, 600);
+  ctx.textAlign='center'; ctx.fillStyle = COLORS.white;
+  ctx.fillText(metaText, contentX + contentW/2, contentTop + guideH - 40*app.dpr + 14*app.dpr);
+
+  // Question body area
+  const bodyTop = contentTop + guideH + 10*app.dpr;
+  const bodyH = h - bodyTop - pad;
+  drawQuestionBody(qz, q, contentX, bodyTop, contentW, bodyH);
+
+  // Timer tick
+  const dt = (app.now - app.last)/1000;
+  qz.timeLeft -= dt;
+  if (qz.timeLeft <= 0) {
+    // Time up
+    showToast('⏰ Time’s up!');
+    qz.answers[qz.idx] = false;
+    nextQuestion();
+  }
+}
+
+function drawQuestionBody(qz, q, x, y, w, h) {
+  if (q.type === 'mcq' || q.type === 'plural') {
+    const options = q.options;
+    const gap = 10*app.dpr;
+    const btnH = Math.max(UI.minTap*app.dpr, 48*app.dpr);
+    const btnW = Math.min(w, 680*app.dpr);
+    const cx = x + (w - btnW)/2;
+    let yy = y;
+    for (let i=0;i<options.length;i++){
+      const id = 'opt_'+i;
+      drawButton( options[i], cx, yy, btnW, btnH, id, 'rgba(255,255,255,0.10)', COLORS.glassBorder );
+      yy += btnH + gap;
+    }
+  } else if (q.type === 'matching') {
+    // Left column (3), Right column (3), connect by tapping
+    const colGap = 18*app.dpr, rowGap = 10*app.dpr;
+    const colW = (w - colGap) / 2;
+    const cardH = Math.max(UI.minTap*app.dpr, 56*app.dpr);
+
+    if (!q._sel) q._sel = { left: null, pairs: [] }; // pairs: [{L:i, R:j}]
+    // left
+    for (let i=0;i<3;i++){
+      const tx = x, ty = y + i*(cardH + rowGap);
+      drawGlass(tx,ty,colW,cardH);
+      setFont(UI.baseFontPx*app.dpr*1.0, 600);
+      ctx.textAlign='left'; ctx.fillStyle=COLORS.white;
+      ctx.fillText(q.left[i], tx + 12*app.dpr, ty + cardH/2);
+      app.rects.push({ id:'match_L_'+i, x:tx, y:ty, w:colW, h:cardH });
+    }
+    // right
+    for (let j=0;j<3;j++){
+      const tx = x + colW + colGap, ty = y + j*(cardH + rowGap);
+      drawGlass(tx,ty,colW,cardH);
+      setFont(UI.baseFontPx*app.dpr*1.0, 700);
+      ctx.textAlign='center';
+      ctx.fillText(q.right[j], tx + colW/2, ty + cardH/2);
+      app.rects.push({ id:'match_R_'+j, x:tx, y:ty, w:colW, h:cardH });
+    }
+    // Draw lines for confirmed pairs
+    ctx.lineWidth = 2*app.dpr; ctx.strokeStyle = COLORS.blue;
+    q._sel.pairs.forEach(p => {
+      const L = app.rects.find(r=>r.id==='match_L_'+p.L);
+      const R = app.rects.find(r=>r.id==='match_R_'+p.R);
+      if (L && R) {
+        const lx = L.x+L.w, ly = L.y+L.h/2;
+        const rx = R.x, ry = R.y+R.h/2;
+        ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(rx, ry); ctx.stroke();
+      }
+    });
+
+    // Validate if done
+    if (q._sel.pairs.length === 3) {
+      const ok = q._sel.pairs.every(p => q.answerMap[p.L] === q.right[p.R]);
+      qz.answers[qz.idx] = !!ok;
+      showToast(ok ? '✅ Correct!' : '❌ Incorrect!');
+      if (ok) qz.correct++;
+      q._sel = null; // reset
+      nextQuestion();
+    }
+
+  } else if (q.type === 'order') {
+    if (!q._sel) q._sel = [];
+    const tokens = q.tokens;
+
+    // Selected row
+    const selH = Math.max(UI.minTap*app.dpr, 48*app.dpr);
+    drawGlass(x, y, w, selH);
+    let tx = x + 10*app.dpr, ty = y + selH/2;
+    for (const t of q._sel) {
+      const tw = measure(t) + 28*app.dpr;
+      drawPill(tx, y + 6*app.dpr, tw, selH-12*app.dpr, COLORS.glassBorder, 'rgba(255,255,255,0.12)');
+      setFont(UI.baseFontPx*app.dpr*1.0, 600);
+      ctx.textAlign='center';
+      ctx.fillText(t, tx + tw/2, ty);
+      app.rects.push({ id:'sel_'+t, x:tx, y:y+6*app.dpr, w:tw, h:selH-12*app.dpr });
+      tx += tw + 8*app.dpr;
+    }
+
+    // Available tokens
+    const gridY = y + selH + 10*app.dpr;
+    const rowH = Math.max(UI.minTap*app.dpr, 48*app.dpr);
+    let curX = x, curY = gridY;
+    const gap = 8*app.dpr;
+
+    for (const t of tokens) {
+      const used = q._sel.includes(t);
+      const tw = measure(t) + 28*app.dpr;
+      if (curX + tw > x + w) { curX = x; curY += rowH + gap; }
+      drawPill(curX, curY, tw, rowH, COLORS.glassBorder,
+               used ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.12)');
+      setFont(UI.baseFontPx*app.dpr*1.0, 600);
+      ctx.textAlign='center';
+      ctx.fillStyle = used ? 'rgba(255,255,255,0.7)': COLORS.white;
+      ctx.fillText(t, curX + tw/2, curY + rowH/2);
+      app.rects.push({ id:'tok_'+t, x:curX, y:curY, w:tw, h:rowH, used });
+      curX += tw + gap;
+    }
+
+    // Auto-validate when all tokens placed
+    if (q._sel.length === q.tokens.length) {
+      const ok = arraysEqual(q._sel, q.correct);
+      app.quiz.answers[app.quiz.idx] = !!ok;
+      showToast(ok ? '✅ Correct!' : '❌ Incorrect!');
+      if (ok) app.quiz.correct++;
+      q._sel = null;
+      nextQuestion();
+    }
+  }
+}
+
+function arraysEqual(a,b) {
+  if (a.length!==b.length) return false;
+  for (let i=0;i<a.length;i++) if (a[i]!==b[i]) return false;
+  return true;
+}
+
+function measure(text) {
+  setFont(UI.baseFontPx*app.dpr*1.0, 600);
+  return ctx.measureText(text).width;
+}
+
+function wrapLines(text, maxW) {
+  setFont(UI.baseFontPx*app.dpr*1.0, 700);
+  const words = text.split(' ');
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    const test = cur ? (cur + ' ' + w) : w;
+    if (ctx.measureText(test).width > maxW) {
+      if (cur) lines.push(cur);
+      cur = w;
+    } else {
+      cur = test;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+function cacheMeasure(qz, q) {
+  // Placeholder: we already wrap on draw. Kept for future perf.
+  return;
+}
+
+/* ===========================
+   TAP HANDLER
+=========================== */
+
+function handleTap(pt) {
+  const r = app.rects.find(rc => hitRect(pt, rc));
+  if (!r) return;
+
+  if (app.state === STATE.START) {
+    if (r.id.startsWith('key_')) {
+      const key = r.id.slice(4);
+      if (key === 'CLR') {
+        app.startCodeBuffer = ''; app.startError = '';
+      } else if (key === 'START') {
+        if (app.startCodeBuffer === ACCESS_CODE) {
+          app.startError = '';
+          startQuiz();
+        } else {
+          app.startError = 'Invalid code. Try again.';
+          app.startCodeBuffer = '';
+        }
+      } else {
+        if (app.startCodeBuffer.length < 8) {
+          app.startCodeBuffer += key;
+        }
+      }
+    } else if (r.id === 'about_link') {
+      app.state = STATE.ABOUT;
+    } else if (r.id === 'download_now') {
+      autoDownloadSelf();
+    }
+  } else if (app.state === STATE.ABOUT) {
+    if (r.id === 'about_close') { app.state = STATE.START; }
+  } else if (app.state === STATE.QUIZ) {
+    const q = app.quiz.questions[app.quiz.idx];
+
+    if (q.type === 'mcq' || q.type === 'plural') {
+      if (r.id.startsWith('opt_')) {
+        const idx = parseInt(r.id.slice(4),10);
+        const ok = (idx === q.answerIndex);
+        app.quiz.answers[app.quiz.idx] = !!ok;
+        if (ok) app.quiz.correct++;
+        showToast(ok ? '✅ Correct!' : '❌ Incorrect!');
+        nextQuestion();
+      }
+    } else if (q.type === 'matching') {
+      if (!q._sel) q._sel = { left:null, pairs:[] };
+      if (r.id.startsWith('match_L_')) {
+        const i = parseInt(r.id.slice(8),10);
+        q._sel.left = i;
+      } else if (r.id.startsWith('match_R_')) {
+        const j = parseInt(r.id.slice(8),10);
+        if (q._sel.left !== null) {
+          // Avoid duplicate left or right
+          if (!q._sel.pairs.some(p => p.L===q._sel.left) && !q._sel.pairs.some(p => p.R===j)) {
+            q._sel.pairs.push({ L:q._sel.left, R:j });
+          }
+          q._sel.left = null;
+        }
+      }
+    } else if (r.type === 'order' || (q.type === 'order')) {
+      const qq = q; // clarity
+      if (!qq._sel) qq._sel = [];
+      if (r.id && r.id.startsWith('tok_')) {
+        const t = r.id.slice(4);
+        if (qq._sel.includes(t)) {
+          // Remove
+          qq._sel = qq._sel.filter(x => x!==t);
+        } else {
+          qq._sel.push(t);
+        }
+      } else if (r.id && r.id.startsWith('sel_')) {
+        const t = r.id.slice(4);
+        qq._sel = qq._sel.filter(x => x!==t);
+      }
+    }
+  } else if (app.state === STATE.BLACKOUT) {
+    // Ignored; we’ll auto-return to START
+  } else if (app.state === STATE.FINISH) {
+    // No buttons (auto-download handled)
+  }
+}
+
+/* ===========================
+   SECURITY HANDLING
+=========================== */
+
+function triggerSecurity(msg) {
+  // Avoid infinite loops if already in START/BLACKOUT
+  if (app.state === STATE.BLACKOUT) return;
+
+  app.blackout = { msg, ts: performance.now() };
+  app.state = STATE.BLACKOUT;
+  setTimeout(() => {
+    app.state = STATE.START;
+    app.startCodeBuffer = '';
+    app.startError = '';
+    // Fresh session → new random sample
+  }, UI.blackoutMs);
+}
+
+function getOrientation() {
+  const { innerWidth:w, innerHeight:h } = window;
+  return (h >= w) ? 'portrait' : 'landscape';
+}
+
+/* ===========================
+   FINISH & DOWNLOAD
+=========================== */
+function drawFinish() {
+  const { w,h } = app;
+  // Center card
+  const cardW = Math.min(w - 32*app.dpr, 420*app.dpr);
+  const cardH = Math.min(h - 32*app.dpr, 260*app.dpr);
+  const x = (w-cardW)/2, y = (h-cardH)/2;
+  drawGlass(x,y,cardW,cardH);
+
+  // Score out of 5.0 (1 decimal)
+  const correct = app.quiz?.correct || 0;
+  const score5 = ((correct / UI.totalQuestions) * 5).toFixed(1);
+
+  setFont(UI.baseFontPx*app.dpr*1.2, 800);
+  ctx.textAlign='center'; ctx.fillStyle = COLORS.white;
+  ctx.fillText('Your final score is', x+cardW/2, y+50*app.dpr);
+
+  setFont(UI.baseFontPx*app.dpr*2.0, 900);
+  ctx.fillStyle = COLORS.yellow;
+  ctx.fillText(`${score5} / 5.0`, x+cardW/2, y+110*app.dpr);
+
+  // Manual download button (in case auto-download is blocked)
+  const btnW = 220*app.dpr, btnH = 44*app.dpr;
+  drawButton('⬇ Download this HTML', x+cardW/2 - btnW/2, y+cardH - btnH - 18*app.dpr, btnW, btnH, 'download_now',
+             'rgba(255,255,255,0.12)', COLORS.blue);
+
+  // Auto-download only once
+  if (!app.finishDownloaded) {
+    app.finishDownloaded = true;
+    setTimeout(autoDownloadSelf, 400);
+  }
+}
+
+function autoDownloadSelf() {
+  try {
+    const html = '<!doctype html>\n' + document.documentElement.outerHTML;
+    const blob = new Blob([html], { type:'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g,'-');
+    a.href = url;
+    a.download = `present-simple-a1-${ts}.html`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 1500);
+  } catch(e) {
+    // ignore
+  }
+}
+
+/* ===========================
+   INIT
+=========================== */
+// Kick off at START; canvas focus (best effort)
+canvas.tabIndex = 0;
+canvas.focus();
+
+})();
+</script>
+</body>
+</html>
